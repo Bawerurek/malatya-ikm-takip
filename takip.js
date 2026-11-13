@@ -9,7 +9,8 @@ const SITE_URL = 'http://aciklandinmi.gt.tc';
 const STATE_FILE = path.join(__dirname, 'seen.json');
 
 const TOKEN = process.env.TELEGRAM_BOT_TOKEN;
-const CHAT_IDS = (process.env.TELEGRAM_CHAT_ID || '').split(',').map(s => s.trim()).filter(Boolean);
+const ADMIN_IDS = (process.env.TELEGRAM_CHAT_ID || '').split(',').map(s => s.trim()).filter(Boolean);
+let CHAT_IDS = [...ADMIN_IDS];
 const MANUAL = process.env.GITHUB_EVENT_NAME === 'workflow_dispatch';
 
 function normalizeTr(str) {
@@ -36,6 +37,38 @@ function isIkmResult(title) {
     const isResult = ['sonuc', 'nihai', 'yerlestirme', 'mulakat', 'sozlu sinav', 'kazanan', 'basari'].some(k => t.includes(k));
     const isOldSchedule = ['tarihlerini gosterir', 'aday tespit', 'boy kilo'].some(k => t.includes(k));
     return isResult && !isOldSchedule;
+}
+
+async function sendTo(chatId, text) {
+    const res = await fetch(`https://api.telegram.org/bot${TOKEN}/sendMessage`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ chat_id: chatId, text, parse_mode: 'HTML', disable_web_page_preview: true })
+    });
+    return res.json();
+}
+
+// Bota /start yazanlari abone yapar, /stop yazanlari cikarir
+async function processSubscriptions(state) {
+    const subs = new Set(state.subscribers || []);
+    const res = await fetch(`https://api.telegram.org/bot${TOKEN}/getUpdates?offset=${(state.update_offset || 0)}&timeout=0`);
+    const data = await res.json();
+    if (!data.ok) { console.error('getUpdates hatasi:', data.description); return subs; }
+    for (const u of data.result) {
+        state.update_offset = u.update_id + 1;
+        const msg = u.message;
+        if (!msg || !msg.text) continue;
+        const id = String(msg.chat.id);
+        const cmd = msg.text.trim().toLowerCase();
+        if (cmd.startsWith('/start')) {
+            subs.add(id);
+            await sendTo(id, `✅ <b>Abone oldunuz!</b>\n\nMalatya Adliyesi'ne yeni duyuru eklendiğinde ve 🚨 İKM mülakat sonuçları açıklandığında size buradan haber vereceğim.\n\nBildirimleri durdurmak için /stop yazın.\n\n🌐 Site: ${SITE_URL}`);
+        } else if (cmd.startsWith('/stop')) {
+            subs.delete(id);
+            await sendTo(id, `🔕 Aboneliğiniz iptal edildi. Tekrar başlamak için /start yazın.`);
+        }
+    }
+    return subs;
 }
 
 async function sendTelegram(text) {
@@ -72,17 +105,26 @@ async function fetchAnnouncements() {
 }
 
 async function main() {
-    if (!TOKEN || CHAT_IDS.length === 0) throw new Error('TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID secret eksik!');
+    if (!TOKEN || ADMIN_IDS.length === 0) throw new Error('TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID secret eksik!');
 
     let state = { seen: [], initialized: false };
     if (fs.existsSync(STATE_FILE)) state = JSON.parse(fs.readFileSync(STATE_FILE, 'utf8'));
+
+    // Yeni aboneleri (/start) ve iptalleri (/stop) işle
+    const subs = await processSubscriptions(state);
+    state.subscribers = [...subs];
+    CHAT_IDS = [...new Set([...ADMIN_IDS, ...subs])];
+    const saveState = () => fs.writeFileSync(STATE_FILE, JSON.stringify(state, null, 2));
+    // Test mesajları sadece yöneticiye gider
+    const sendAdmin = async (text) => { for (const id of ADMIN_IDS) await sendTo(id, text); };
 
     let items;
     try {
         items = await fetchAnnouncements();
     } catch (e) {
         console.error('Adliye sitesine erişilemedi:', e.message);
-        if (MANUAL) await sendTelegram(`⚠️ <b>Test çalıştırması:</b> Malatya Adliyesi sitesine erişilemedi.\nHata: ${escapeHtml(e.message)}`);
+        if (MANUAL) await sendAdmin(`⚠️ <b>Test çalıştırması:</b> Malatya Adliyesi sitesine erişilemedi.\nHata: ${escapeHtml(e.message)}`);
+        saveState();
         process.exit(1);
     }
 
@@ -112,13 +154,15 @@ async function main() {
             await sendTelegram(msg);
         }
         if (MANUAL && newItems.length === 0) {
-            await sendTelegram(`🔎 <b>Test çalıştırması başarılı.</b>\nYeni duyuru yok, İKM sonucu henüz açıklanmadı. Takip devam ediyor.\n\n🌐 Site: ${SITE_URL}`);
+            await sendAdmin(`🔎 <b>Test çalıştırması başarılı.</b>\nYeni duyuru yok, İKM sonucu henüz açıklanmadı. Takip devam ediyor.\n👥 Abone sayısı: ${CHAT_IDS.length}\n\n🌐 Site: ${SITE_URL}`);
         }
     }
 
     items.forEach(i => seen.add(i.url));
-    state = { initialized: true, seen: [...seen].slice(-500), last_check: new Date().toISOString() };
-    fs.writeFileSync(STATE_FILE, JSON.stringify(state, null, 2));
+    state.initialized = true;
+    state.seen = [...seen].slice(-500);
+    state.last_check = new Date().toISOString();
+    saveState();
     console.log(`Kontrol tamam. ${items.length} duyuru, ${newItems.length} yeni.`);
 }
 
