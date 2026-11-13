@@ -9,7 +9,7 @@ const SITE_URL = 'http://aciklandinmi.gt.tc';
 const STATE_FILE = path.join(__dirname, 'seen.json');
 
 const TOKEN = process.env.TELEGRAM_BOT_TOKEN;
-const CHAT_ID = process.env.TELEGRAM_CHAT_ID;
+const CHAT_IDS = (process.env.TELEGRAM_CHAT_ID || '').split(',').map(s => s.trim()).filter(Boolean);
 const MANUAL = process.env.GITHUB_EVENT_NAME === 'workflow_dispatch';
 
 function normalizeTr(str) {
@@ -39,14 +39,17 @@ function isIkmResult(title) {
 }
 
 async function sendTelegram(text) {
-    const res = await fetch(`https://api.telegram.org/bot${TOKEN}/sendMessage`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ chat_id: CHAT_ID, text, parse_mode: 'HTML', disable_web_page_preview: true })
-    });
-    const data = await res.json();
-    if (!data.ok) console.error('Telegram hatası:', data.description);
-    return data.ok;
+    let allOk = true;
+    for (const chatId of CHAT_IDS) {
+        const res = await fetch(`https://api.telegram.org/bot${TOKEN}/sendMessage`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ chat_id: chatId, text, parse_mode: 'HTML', disable_web_page_preview: true })
+        });
+        const data = await res.json();
+        if (!data.ok) { console.error('Telegram hatası (' + chatId + '):', data.description); allOk = false; }
+    }
+    return allOk;
 }
 
 async function fetchAnnouncements() {
@@ -69,7 +72,7 @@ async function fetchAnnouncements() {
 }
 
 async function main() {
-    if (!TOKEN || !CHAT_ID) throw new Error('TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID secret eksik!');
+    if (!TOKEN || CHAT_IDS.length === 0) throw new Error('TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID secret eksik!');
 
     let state = { seen: [], initialized: false };
     if (fs.existsSync(STATE_FILE)) state = JSON.parse(fs.readFileSync(STATE_FILE, 'utf8'));
