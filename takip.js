@@ -11,7 +11,7 @@ const STATE_FILE = path.join(__dirname, 'seen.json');
 const TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const ADMIN_IDS = (process.env.TELEGRAM_CHAT_ID || '').split(',').map(s => s.trim()).filter(Boolean);
 let CHAT_IDS = [...ADMIN_IDS];
-const MANUAL = process.env.GITHUB_EVENT_NAME === 'workflow_dispatch';
+const SEND_TEST_MSG = process.env.SEND_TEST_MSG === 'true';
 
 function normalizeTr(str) {
     const map = { 'İ': 'i', 'I': 'i', 'ı': 'i', 'ö': 'o', 'Ö': 'o', 'ü': 'u', 'Ü': 'u', 'ş': 's', 'Ş': 's', 'ç': 'c', 'Ç': 'c', 'ğ': 'g', 'Ğ': 'g' };
@@ -28,6 +28,10 @@ function decodeEntities(s) {
 
 function escapeHtml(s) {
     return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
+function cleanDisplayUrl(url) {
+    return url.split(/\s+/)[0];
 }
 
 function isIkmResult(title) {
@@ -50,12 +54,20 @@ async function sendTo(chatId, text) {
 
 // Bota /start yazanlari abone yapar, /stop yazanlari cikarir
 async function processSubscriptions(state) {
-    const subs = new Set(state.subscribers || []);
-    const res = await fetch(`https://api.telegram.org/bot${TOKEN}/getUpdates?offset=${(state.update_offset || 0)}&timeout=0`);
+    const prevSubs = state.subscribers || [];
+    const subs = new Set(prevSubs);
+    const prevOffset = state.update_offset || 0;
+    let changed = false;
+
+    const res = await fetch(`https://api.telegram.org/bot${TOKEN}/getUpdates?offset=${prevOffset}&timeout=0`);
     const data = await res.json();
-    if (!data.ok) { console.error('getUpdates hatasi:', data.description); return subs; }
+    if (!data.ok) {
+        console.error('getUpdates hatasi:', data.description);
+        return { subs, changed: false };
+    }
     for (const u of data.result) {
         state.update_offset = u.update_id + 1;
+        changed = true;
         const msg = u.message;
         if (!msg || !msg.text) continue;
         const id = String(msg.chat.id);
@@ -68,18 +80,13 @@ async function processSubscriptions(state) {
             await sendTo(id, `🔕 Aboneliğiniz iptal edildi. Tekrar başlamak için /start yazın.`);
         }
     }
-    return subs;
+    return { subs, changed };
 }
 
 async function sendTelegram(text) {
     let allOk = true;
     for (const chatId of CHAT_IDS) {
-        const res = await fetch(`https://api.telegram.org/bot${TOKEN}/sendMessage`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ chat_id: chatId, text, parse_mode: 'HTML', disable_web_page_preview: true })
-        });
-        const data = await res.json();
+        const data = await sendTo(chatId, text);
         if (!data.ok) { console.error('Telegram hatası (' + chatId + '):', data.description); allOk = false; }
     }
     return allOk;
@@ -110,12 +117,16 @@ async function main() {
     let state = { seen: [], initialized: false };
     if (fs.existsSync(STATE_FILE)) state = JSON.parse(fs.readFileSync(STATE_FILE, 'utf8'));
 
-    // Yeni aboneleri (/start) ve iptalleri (/stop) işle
-    const subs = await processSubscriptions(state);
-    state.subscribers = [...subs];
+    const wasInitialized = Boolean(state.initialized);
+    const { subs, changed: subsChanged } = await processSubscriptions(state);
+    if (subs.size > 0 || state.subscribers) {
+        state.subscribers = [...subs];
+    }
     CHAT_IDS = [...new Set([...ADMIN_IDS, ...subs])];
-    const saveState = () => fs.writeFileSync(STATE_FILE, JSON.stringify(state, null, 2));
-    // Test mesajları sadece yöneticiye gider
+    const saveState = () => {
+        delete state.last_check;
+        fs.writeFileSync(STATE_FILE, JSON.stringify(state, null, 2) + '\n');
+    };
     const sendAdmin = async (text) => { for (const id of ADMIN_IDS) await sendTo(id, text); };
 
     let items;
@@ -123,16 +134,15 @@ async function main() {
         items = await fetchAnnouncements();
     } catch (e) {
         console.error('Adliye sitesine erişilemedi:', e.message);
-        if (MANUAL) await sendAdmin(`⚠️ <b>Test çalıştırması:</b> Malatya Adliyesi sitesine erişilemedi.\nHata: ${escapeHtml(e.message)}`);
-        saveState();
+        if (SEND_TEST_MSG) await sendAdmin(`⚠️ <b>Test çalıştırması:</b> Malatya Adliyesi sitesine erişilemedi.\nHata: ${escapeHtml(e.message)}`);
+        if (subsChanged) saveState();
         process.exit(1);
     }
 
     const seen = new Set(state.seen);
     const newItems = items.filter(i => !seen.has(i.url));
 
-    if (!state.initialized) {
-        // İlk çalıştırma: mevcut duyuruları kaydet, eski duyurular için bildirim atma
+    if (!wasInitialized) {
         await sendTelegram(
             `✅ <b>AçıklandıMı takip botu 7/24 aktif!</b>\n\n` +
             `Malatya Adliyesi duyuruları her 5 dakikada bir kontrol ediliyor (${items.length} duyuru kaydedildi).\n\n` +
@@ -141,29 +151,34 @@ async function main() {
         );
     } else {
         for (const item of newItems.reverse()) {
+            const link = cleanDisplayUrl(item.url);
             let msg;
             if (isIkmResult(item.title)) {
                 msg = `🚨🚨 <b>MÜJDE! İKM MÜLAKAT SONUÇLARI AÇIKLANDI!</b> 🚨🚨\n\n` +
                       `📢 <b>${escapeHtml(item.title)}</b>\n📅 ${item.date}\n\n` +
-                      `📄 Resmi ilan: ${item.url}\n\n🌐 Site: ${SITE_URL}`;
+                      `📄 Resmi ilan: ${link}\n\n🌐 Site: ${SITE_URL}`;
             } else {
                 msg = `📢 <b>Malatya Adliyesi'nde yeni duyuru</b>\n\n` +
                       `${escapeHtml(item.title)}\n📅 ${item.date}\n\n` +
-                      `📄 İlan: ${item.url}\n\n🌐 Site: ${SITE_URL}`;
+                      `📄 İlan: ${link}\n\n🌐 Site: ${SITE_URL}`;
             }
             await sendTelegram(msg);
         }
-        if (MANUAL && newItems.length === 0) {
+        if (SEND_TEST_MSG && newItems.length === 0) {
             await sendAdmin(`🔎 <b>Test çalıştırması başarılı.</b>\nYeni duyuru yok, İKM sonucu henüz açıklanmadı. Takip devam ediyor.\n👥 Abone sayısı: ${CHAT_IDS.length}\n\n🌐 Site: ${SITE_URL}`);
         }
     }
 
-    items.forEach(i => seen.add(i.url));
-    state.initialized = true;
-    state.seen = [...seen].slice(-500);
-    state.last_check = new Date().toISOString();
-    saveState();
-    console.log(`Kontrol tamam. ${items.length} duyuru, ${newItems.length} yeni.`);
+    // Sadece yeni duyuru varsa, ilk çalıştırmaysa veya abone listesi değiştiyse seen.json'ı kaydet
+    if (!wasInitialized || newItems.length > 0 || subsChanged) {
+        items.forEach(i => seen.add(i.url));
+        state.initialized = true;
+        state.seen = [...seen].slice(-500);
+        saveState();
+        console.log(`Durum güncellendi: ${items.length} duyuru, ${newItems.length} yeni.`);
+    } else {
+        console.log(`Kontrol tamam (değişiklik yok): ${items.length} duyuru, 0 yeni.`);
+    }
 }
 
 main().catch(e => { console.error(e); process.exit(1); });

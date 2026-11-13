@@ -4,6 +4,12 @@ on:
   schedule:
     - cron: '*/5 * * * *'
   workflow_dispatch:
+    inputs:
+      test_mesaji:
+        description: 'Yeni duyuru yoksa da Telegram test mesaji gonder'
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: write
@@ -17,9 +23,11 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - uses: actions/checkout@v4
+      - name: Kodu indir
+        uses: actions/checkout@v4
 
-      - uses: actions/setup-node@v4
+      - name: Node.js kur
+        uses: actions/setup-node@v4
         with:
           node-version: '20'
 
@@ -27,11 +35,12 @@ jobs:
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          SEND_TEST_MSG: ${{ github.event.inputs.test_mesaji }}
         run: node takip.js
 
-      - name: Durumu kaydet
+      - name: Yeni duyuru varsa kaydet
         run: |
           git config user.name "takip-bot"
           git config user.email "takip-bot@users.noreply.github.com"
           git add seen.json
-          git diff --staged --quiet || (git commit -m "Durum guncellendi" && git push)
+          git diff --staged --quiet || (git commit -m "Yeni duyuru kaydedildi" && git push)
